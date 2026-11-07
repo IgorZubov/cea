@@ -1,0 +1,6 @@
+{
+  "name": "cea-fixture-benign",
+  "version": "1.0.0",
+  "description": "TEST FIXTURE for CEA: a harmless package.",
+  "main": "index.js"
+}

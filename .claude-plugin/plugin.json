@@ -1,0 +1,10 @@
+{
+  "name": "cea",
+  "version": "0.1.0",
+  "description": "ChEck Anything: run any npm/PyPI package, repo or install script in a throw-away sandbox and get a local safety report (processes, network, file and secret access).",
+  "author": { "name": "IgorZubov" },
+  "homepage": "https://github.com/IgorZubov/cea",
+  "repository": "https://github.com/IgorZubov/cea",
+  "license": "MIT",
+  "keywords": ["security", "sandbox", "supply-chain", "npm", "pypi", "malware"]
+}

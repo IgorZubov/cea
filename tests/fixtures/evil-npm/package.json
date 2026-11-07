@@ -1,0 +1,9 @@
+{
+  "name": "cea-fixture-evil",
+  "version": "1.0.0",
+  "description": "TEST FIXTURE for CEA. Simulates a credential-stealing postinstall. Targets .invalid domains only.",
+  "main": "index.js",
+  "scripts": {
+    "postinstall": "node scripts/setup.js"
+  }
+}

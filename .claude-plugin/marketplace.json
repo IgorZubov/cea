@@ -1,0 +1,11 @@
+{
+  "name": "cea",
+  "owner": { "name": "IgorZubov" },
+  "plugins": [
+    {
+      "name": "cea",
+      "source": "./",
+      "description": "ChEck Anything: sandbox safety checks for packages, repos and install scripts."
+    }
+  ]
+}
