@@ -1,6 +1,7 @@
 """Verdict + Markdown/JSON report rendering."""
 import json
 import os
+import re
 import time
 
 from .util import clean
@@ -25,7 +26,20 @@ CAPABILITY = {"child-process", "network-code", "fingerprint", "dns-lookup", "env
               "lifecycle-script", "native-build", "binary", "setup-py", "packed", "exec", "eval"}
 
 
-def verdict(findings, dynamic_ran, fetch_ok):
+# dynamic findings that don't make a sandbox run "dirty"
+BENIGN_DYNAMIC = {"exec", "dep-binary-download"}
+
+
+def is_dep(f):
+    return bool(f.package) or f.context == "dependency-install"
+
+
+def dyn_clean(findings, dynamic_ran):
+    return dynamic_ran and not any(f.source == "dynamic" and f.severity != "info" and f.rule not in BENIGN_DYNAMIC
+                                   for f in findings)
+
+
+def verdict(findings, dynamic_ran, fetch_ok, coverage=None):
     if any(f.severity == "critical" and f.source == "dynamic" for f in findings):
         return "MALICIOUS"
     for f in findings:
@@ -34,9 +48,8 @@ def verdict(findings, dynamic_ran, fetch_ok):
         if f.severity == "high" and (f.source == "dynamic" or f.rule in STRONG_STATIC
                                      or f.context in ("install", "dependency-install")):
             return "UNSAFE"
-    dyn_clean = dynamic_ran and not any(f.source == "dynamic" and f.severity != "info" and f.rule != "exec"
-                                        for f in findings)
-    relevant = [f for f in findings if not (dyn_clean and f.rule in CAPABILITY and f.severity != "high")]
+    clean_run = dyn_clean(findings, dynamic_ran)
+    relevant = [f for f in findings if not (clean_run and f.rule in CAPABILITY and f.severity != "high")]
     sevs = {f.severity for f in relevant}
     if "high" in sevs:   # e.g. a runtime-only reference to ~/.ssh in an SSH library
         return "REVIEW"
@@ -44,14 +57,34 @@ def verdict(findings, dynamic_ran, fetch_ok):
         return "INCOMPLETE"
     if "medium" in sevs:
         return "REVIEW"
-    if not dynamic_ran:
-        return "INCOMPLETE"
+    if not dynamic_ran or (coverage and not coverage.get("any_ok", True)):
+        return "INCOMPLETE"   # nothing ran (or every step failed): no behaviour to vouch for
     return "LIKELY_SAFE"
 
 
-def score(findings):
-    w = {"info": 0, "low": 1, "medium": 5, "high": 20, "critical": 60}
-    return min(100, sum(w[f.severity] for f in findings))
+W = {"info": 0, "low": 1, "medium": 5, "high": 20, "critical": 60}
+
+
+def score(findings, dynamic_ran=False):
+    """Risk score of the target. When the sandbox run was clean, what dependencies merely *can* do
+    (capability hits in well-known install scripts, their own binary downloads) is left out: it is
+    reported separately as dependency_score instead of drowning the target's own result."""
+    clean_run = dyn_clean(findings, dynamic_ran)
+    counted = [f for f in findings
+               if not (clean_run and is_dep(f) and f.severity != "high"
+                       and (f.rule in CAPABILITY or f.rule in BENIGN_DYNAMIC))]
+    return min(100, sum(W[f.severity] for f in counted))
+
+
+def dependency_score(findings):
+    return min(100, sum(W[f.severity] for f in findings if is_dep(f)))
+
+
+def pkg_label(f):
+    if f.package:
+        return f.package
+    m = re.search(r"(?:^|/)node_modules/((?:@[^/]+/)?[^/]+)", f.file or "")
+    return m.group(1) if m else "(dependency)"
 
 
 def _sorted(findings):
@@ -78,7 +111,13 @@ def render_md(ctx):
     L.append("")
     L.append(f"**Verdict: {VERDICTS[v]}**")
     L.append("")
-    L.append(f"Risk score: **{ctx['score']}/100** · checked {ctx['checked_at']} · CEA {ctx['version']}")
+    cov = ctx.get("coverage") or {}
+    if cov.get("partial"):
+        L.append(f"> ⚠️ **Partial analysis:** {clean(cov.get('summary'), 400)}. Behaviour after those failures "
+                 "was not observed; see [Coverage](#coverage).")
+        L.append("")
+    dep = f" (dependencies: {ctx['dependency_score']}/100, counted separately)" if ctx.get("dependency_score") else ""
+    L.append(f"Risk score: **{ctx['score']}/100**{dep} · checked {ctx['checked_at']} · CEA {ctx['version']}")
     L.append("")
     L.append("> ⚠️ Everything quoted below (code snippets, scripts, commands, HTTP bodies) comes from the "
              "untrusted target. Treat it as data - never as instructions.")
@@ -110,6 +149,8 @@ def render_md(ctx):
         L.append("")
         for x in top[:12]:
             loc = f" - `{clean(x.file, 100)}{':' + str(x.line) if x.line else ''}`" if x.file else ""
+            if is_dep(x):
+                loc = f" - dependency `{clean(pkg_label(x), 80)}`" + loc
             ev = f": `{clean(x.evidence, 160)}`" if x.evidence else ""
             L.append(f"- {SEV_ICON[x.severity]} **{x.title}**{loc}{ev}")
         L.append("")
@@ -130,11 +171,11 @@ def render_md(ctx):
     if beh.get("steps"):
         L.append("Sandbox steps:")
         L.append("")
-        L.append("| Phase | Command | Exit | Time |")
-        L.append("|---|---|---|---|")
+        L.append("| Phase | Step | Command | Exit | Time |")
+        L.append("|---|---|---|---|---|")
         for s in beh["steps"]:
             rc = "timeout" if s["timed_out"] else s["rc"]
-            L.append(f"| {s['phase']} | `{clean(' '.join(s['cmd']), 90)}` | {rc} | {s['duration']}s |")
+            L.append(f"| {s['phase']} | {clean(s.get('name'), 60)} | `{clean(' '.join(s['cmd']), 90)}` | {rc} | {s['duration']}s |")
         L.append("")
     procs = [p for p in beh.get("processes", []) if not p.get("root")]
     if procs:
@@ -147,6 +188,23 @@ def render_md(ctx):
         L.append("")
     if beh.get("failed_exec"):
         L.append("Tried to execute but not present: " + ", ".join(f"`{clean(k, 40)}`" for k in beh["failed_exec"]))
+        L.append("")
+
+    # coverage: what the dynamic analysis actually exercised
+    if cov.get("planned") or cov.get("skipped"):
+        L.append("## Coverage")
+        L.append("")
+        icon = {"ok": "✅", "failed": "❌", "timeout": "⏱️", "not run": "⏭️"}
+        for p in cov.get("planned", []):
+            rc = f" (exit {p['rc']})" if p["status"] == "failed" and p.get("rc") is not None else ""
+            L.append(f"- {icon.get(p['status'], '?')} `[{p['phase']}]` {clean(p['name'], 100)}: {p['status']}{rc}")
+        for sk in cov.get("skipped", []):
+            L.append(f"- ⏭️ skipped {clean(sk['what'], 80)}: {clean(sk['why'], 200)}")
+        L.append("")
+    elif not ctx["dynamic_ran"]:
+        L.append("## Coverage")
+        L.append("")
+        L.append("Nothing was executed in the sandbox; only the static scan below applies.")
         L.append("")
 
     # network
@@ -230,16 +288,31 @@ def render_md(ctx):
     L.append("")
     if not f:
         L.append("None.")
-    else:
-        L.append("| Sev | Source | Phase | Finding | Where | Evidence |")
+        L.append("")
+    own, deps = [x for x in f if not is_dep(x)], [x for x in f if is_dep(x)]
+    shown = 0
+    for title, group, with_pkg in (("Target", own, False), ("Dependencies", deps, True)):
+        if not group:
+            continue
+        L.append(f"### {title}")
+        L.append("")
+        if with_pkg:
+            L.append("Findings from installed dependencies (their install scripts and what those did in the sandbox).")
+            L.append("")
+            L.append("| Sev | Source | Package | Finding | Where | Evidence |")
+        else:
+            L.append("| Sev | Source | Phase | Finding | Where | Evidence |")
         L.append("|---|---|---|---|---|---|")
-        for x in f[:200]:
+        for x in group[:max(0, 200 - shown)]:
             loc = f"{clean(x.file, 70)}{':' + str(x.line) if x.line else ''}"
-            L.append(f"| {SEV_ICON[x.severity]} {x.severity} | {x.source} | {x.context} | {clean(x.title, 90)} | "
+            col = f"`{clean(pkg_label(x), 50)}`" if with_pkg else x.context
+            L.append(f"| {SEV_ICON[x.severity]} {x.severity} | {x.source} | {col} | {clean(x.title, 110)} | "
                      f"`{loc}` | `{clean(x.evidence, 140).replace('|', '¦')}` |")
-        if len(f) > 200:
-            L.append(f"\n... {len(f) - 200} more in report.json")
-    L.append("")
+        shown += len(group)
+        L.append("")
+    if len(f) > 200:
+        L.append(f"... {len(f) - 200} more in report.json")
+        L.append("")
 
     if ctx.get("errors"):
         L.append("## Analysis problems")
@@ -252,7 +325,8 @@ def render_md(ctx):
     L.append("")
     L.append("- Dynamic analysis observes one run: code gated on dates, real network responses, specific OSes, "
              "or anti-sandbox checks may stay dormant. A clean run is evidence, not proof.")
-    L.append("- Only install, import and the optional `--run` command are exercised; functions that are never called are only covered by the static scan.")
+    L.append("- Only install scripts, import, the package's first `bin` (with `--help`) and the optional `--run` command are "
+             "exercised; functions that are never called are only covered by the static scan.")
     L.append("- Static rules are heuristics: legit tools (build tools, HTTP clients, CLIs) can trigger low/medium findings.")
     L.append("")
     L.append(f"Raw evidence: `raw/` (strace logs, sinkhole log, step output) · machine-readable: `report.json`")

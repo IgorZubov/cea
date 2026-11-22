@@ -10,7 +10,7 @@ import tarfile
 import time
 
 from . import __version__, dynamic, report, static_scan
-from .sandbox import Engine, SandboxError, image_tag
+from .sandbox import BUILD_NEEDS, REGISTRY_REPO, Engine, SandboxError, image_tag
 from .target import TargetError, parse_target
 from .util import Finding, clean
 
@@ -32,11 +32,43 @@ def log(msg, quiet=False):
 
 
 # ------------------------------------------------------------------ planning
-def build_plan(target, meta, work, args):
-    steps = []
+# Runs a declared `bin` the way its shebang asks (no chmod/head helpers: they'd show up as findings).
+RUN_BIN = r'''f="$1"; shift
+if [ ! -f "$f" ]; then echo "[cea] bin not found (not built?): $f"; exit 127; fi
+IFS= read -r first < "$f" || true
+case "$first" in
+  "#!"*) exec ${first#??} "$f" "$@" ;;
+  *) if [ -x "$f" ]; then exec "$f" "$@"; else exec node "$f" "$@"; fi ;;
+esac'''
+APP = "/sandbox/app"
+
+
+def _bin_entries(pkg_json):
+    b = pkg_json.get("bin")
+    name = pkg_json.get("name") if isinstance(pkg_json.get("name"), str) else ""
+    name = name.rsplit("/", 1)[-1]
+    if isinstance(b, str):
+        return [(name or "cli", b)]
+    if isinstance(b, dict):
+        return [(k, v) for k, v in b.items() if isinstance(v, str)]
+    return []
+
+
+def _safe_rel(path):
+    """A package-relative path we are willing to pass to the sandbox (no escapes, no options)."""
+    if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        return None
+    p = os.path.normpath(path.strip())
+    return None if p in (".", "") or p.startswith(("..", "/", "-")) else p
+
+
+def build_plan(target, meta, work, args, stats=None):
+    """Returns (steps, skipped): skipped = [(what, why)] for the report's coverage section."""
+    steps, skipped = [], []
     T = args.timeout
     kind = meta.get("kind", target.kind)
     eco = meta.get("ecosystems") or []
+    stats = stats or {}
     pkg_json = {}
     pj_path = os.path.join(work, "src", "package.json")
     if os.path.isfile(pj_path):
@@ -44,39 +76,100 @@ def build_plan(target, meta, work, args):
             pkg_json = json.load(open(pj_path, errors="replace"))
         except ValueError:
             pass
+        if not isinstance(pkg_json, dict):
+            pkg_json = {}
 
     if "npm" in eco:
-        steps.append({"name": "npm install scripts (all packages)", "phase": "install", "timeout": T,
-                      "cmd": ["npm", "rebuild", "--foreground-scripts", "--no-audit", "--no-fund"]})
-        if kind in ("dir", "git"):
-            sc = pkg_json.get("scripts") or {}
-            # `npm rebuild` already ran the root's (pre|post)install; `prepare` runs on a dev's `npm install`
+        registry = kind in ("npm", "npm-tarball")
+        name = meta.get("name") if registry else None
+        pkg_dir = f"{APP}/node_modules/{name}" if registry and name else APP
+        # One step per package: `npm rebuild` stops at the first failing script, which used to hide
+        # every later package's behaviour. Separate steps also let findings name the package.
+        for d in stats.get("install_script_pkgs", []):
+            nm, ver = d.get("name") or "", d.get("version")
+            if not static_scan.NPM_NAME_RE.match(nm):
+                skipped.append((f"install scripts of {clean(d.get('spec'), 80)}", "package name is not a valid npm name"))
+                continue
+            spec = f"{nm}@{ver}" if ver and static_scan.NPM_VERSION_RE.match(ver) else nm
+            steps.append({"name": f"install scripts: {d.get('spec')}", "phase": "install", "timeout": T,
+                          "package": d.get("spec"), "package_path": d.get("path"), "package_repo": d.get("repo"),
+                          "cmd": ["npm", "rebuild", "--foreground-scripts", "--no-audit", "--no-fund", spec]})
+        sc = pkg_json.get("scripts") if isinstance(pkg_json.get("scripts"), dict) else {}
+        if registry:
+            if name and static_scan.NPM_NAME_RE.match(name):
+                steps.append({"name": f"install scripts: {name}", "phase": "install", "timeout": T,
+                              "cmd": ["npm", "rebuild", "--foreground-scripts", "--no-audit", "--no-fund", name]})
+        else:
+            # a dev's `npm install` in a clone runs the root's install hooks (and node-gyp for a
+            # binding.gyp) - `npm rebuild .` does exactly that for the root only - and then `prepare`
+            if any(h in sc for h in ("preinstall", "install", "postinstall")) or \
+                    os.path.isfile(os.path.join(work, "src", "binding.gyp")):
+                steps.append({"name": "project install scripts", "phase": "install", "timeout": T,
+                              "cmd": ["npm", "rebuild", "--foreground-scripts", "--no-audit", "--no-fund", "."]})
             hooks = [h for h in ("preprepare", "prepare", "postprepare") if h in sc]
             if hooks:
                 steps.append({"name": "project lifecycle scripts", "phase": "install", "timeout": T,
                               "cmd": ["sh", "-c", "; ".join(f"npm run --if-present {h}" for h in hooks)]})
-        if not args.no_import:
-            name = meta.get("name") if kind in ("npm", "npm-tarball") else "/sandbox/app"
-            if name and (kind in ("npm", "npm-tarball") or pkg_json.get("main") or pkg_json.get("exports")
-                         or os.path.isfile(os.path.join(work, "src", "index.js"))):
-                steps.append({"name": f"import {name}", "phase": "import", "timeout": T,
-                              "cmd": ["node", "-e", NODE_IMPORT, name, str(args.wait)]})
+
+        # entry points that only exist after a build (dist/ is usually not committed)
+        entries = [e for e in (pkg_json.get("main"),) if isinstance(e, str)] + [v for _, v in _bin_entries(pkg_json)]
+        src_dir = os.path.join(work, "src")
+        missing = [e for e in entries if _safe_rel(e) and not os.path.exists(os.path.join(src_dir, _safe_rel(e)))]
+        if missing and not registry:
+            if "build" in sc and not args.no_build:
+                steps.append({"name": "npm run build", "phase": "build", "timeout": T,
+                              "cmd": ["npm", "run", "--if-present", "build"]})
+            else:
+                why = "--no-build" if "build" in sc else "no `build` script"
+                skipped.append(("build", f"{', '.join(missing[:3])} missing in the source and {why}; "
+                                         "entry points that need it will fail"))
+
+        if args.no_import:
+            skipped.append(("import", "--no-import"))
+        elif registry and name:
+            steps.append({"name": f"import {name}", "phase": "import", "timeout": T,
+                          "cmd": ["node", "-e", NODE_IMPORT, name, str(args.wait)]})
+        elif not registry and (pkg_json.get("main") or pkg_json.get("exports")
+                               or os.path.isfile(os.path.join(work, "src", "index.js"))):
+            steps.append({"name": f"import {APP}", "phase": "import", "timeout": T,
+                          "cmd": ["node", "-e", NODE_IMPORT, APP, str(args.wait)]})
+        else:
+            skipped.append(("import", "package has no main/exports/index.js" +
+                            (" (it only declares a bin, which is run instead)" if _bin_entries(pkg_json) else "")))
+
+        bins = _bin_entries(pkg_json)
+        if bins and args.run:
+            skipped.append((f"run bin `{clean(bins[0][0], 40)} --help`", "--run given"))
+        elif bins and args.no_bin:
+            skipped.append((f"run bin `{clean(bins[0][0], 40)} --help`", "--no-bin"))
+        elif bins:
+            cmd_name, rel = bins[0]
+            rel = _safe_rel(rel)
+            if not rel:
+                skipped.append((f"run bin `{clean(cmd_name, 40)}`", "bin path escapes the package"))
+            else:
+                steps.append({"name": f"run bin {cmd_name} --help", "phase": "run", "timeout": min(T, 60),
+                              "cmd": ["sh", "-c", RUN_BIN, "sh", f"{pkg_dir}/{rel}", "--help"]})
+                for other, _ in bins[1:4]:
+                    skipped.append((f"run bin `{clean(other, 40)}`", "only the first bin is run; use --run for others"))
 
     if "python" in eco:
         steps.append({"name": "create venv", "phase": "setup", "timeout": 120, "traced": False,
                       "cmd": ["python3", "-m", "venv", "--system-site-packages", "/sandbox/venv"]})
         pip = ["/sandbox/venv/bin/python", "-m", "pip", "install", "--no-index", "--find-links", "/work/dist",
                "--no-build-isolation", "--disable-pip-version-check"]
-        what = f"/work/dist/{meta['dist_file']}" if meta.get("dist_file") else "/sandbox/app"
+        what = f"/work/dist/{meta['dist_file']}" if meta.get("dist_file") else APP
         steps.append({"name": "pip install", "phase": "install", "timeout": T,
                       "cmd": pip + [what], "fallback": pip + ["--no-deps", what]})
         if not args.no_import:
             steps.append({"name": "import modules", "phase": "import", "timeout": T,
                           "cmd": ["/sandbox/venv/bin/python", "/cea/py_import.py", str(args.wait)]})
+        else:
+            skipped.append(("import modules", "--no-import"))
 
     if kind == "script":
         script = meta.get("script") or os.path.basename(target.spec)
-        path = f"/sandbox/app/{script}"
+        path = f"{APP}/{script}"
         ext = os.path.splitext(script)[1].lower()
         interp = {".sh": ["bash"], ".bash": ["bash"], ".py": ["python3"], ".js": ["node"], ".mjs": ["node"],
                   ".cjs": ["node"], ".ts": ["node", "--experimental-strip-types"]}.get(ext)
@@ -86,7 +179,7 @@ def build_plan(target, meta, work, args):
 
     if args.run:
         steps.append({"name": "user command", "phase": "run", "timeout": T, "cmd": ["sh", "-c", args.run]})
-    return steps
+    return steps, skipped
 
 
 # --------------------------------------------------------------------- check
@@ -172,6 +265,9 @@ def cmd_check(args):
                 engine.build(tag, quiet=q)
         except SandboxError as e:
             errors.append(str(e))
+            errors.append("the sandbox is not available: run `cea doctor` for next steps"
+                          + ("; `--static-only` gives a reduced, static-only check of a local target meanwhile"
+                             if target.local_path else ""))
             engine = None
 
     # ---- 1. fetch (network on, nothing from the target executes)
@@ -218,8 +314,9 @@ def cmd_check(args):
 
     # ---- 3. detonate (no network, honeypot secrets, strace)
     canaries = dynamic.make_canaries()
+    steps, skipped = [], []
     if engine and fetch_ok and not args.static_only:
-        steps = build_plan(target, meta, work, args)
+        steps, skipped = build_plan(target, meta, work, args, stats)
         if not steps:
             errors.append("nothing to execute for this target (unknown project type); use --run '<cmd>'")
         else:
@@ -241,12 +338,14 @@ def cmd_check(args):
 
     # ---- 4. report
     findings = dynamic.dedupe(findings)
-    v = report.verdict(findings, dynamic_ran, fetch_ok)
+    coverage = dynamic.coverage(steps, behaviour, skipped, dynamic_ran)
+    v = report.verdict(findings, dynamic_ran, fetch_ok, coverage)
     ctx = {"version": __version__, "checked_at": report.now(), "duration_s": round(time.time() - t0, 1),
            "target": {"display": target.display, "kind": target.kind, "spec": target.spec, "ref": target.ref},
            "meta": {k: meta.get(k) for k in ("name", "version", "commit", "kind", "ecosystems", "dist_file", "sdist_only")},
-           "verdict": v, "score": report.score(findings), "findings": findings, "behaviour": behaviour,
-           "static_stats": stats, "dynamic_ran": dynamic_ran, "errors": errors}
+           "verdict": v, "score": report.score(findings, dynamic_ran),
+           "dependency_score": report.dependency_score(findings), "findings": findings, "behaviour": behaviour,
+           "coverage": coverage, "static_stats": stats, "dynamic_ran": dynamic_ran, "errors": errors}
     path = report.write(ctx, out_dir)
     if not args.keep_work:
         shutil.rmtree(work, ignore_errors=True)
@@ -254,15 +353,20 @@ def cmd_check(args):
     counts = {s: sum(1 for f in findings if f.severity == s) for s in report.SEV_ORDER}
     top = [f for f in report._sorted(findings) if f.severity in ("critical", "high", "medium")][:8]
     if args.json:
-        print(json.dumps({"verdict": v, "score": ctx["score"], "target": target.display, "report": path,
+        print(json.dumps({"verdict": v, "score": ctx["score"], "dependency_score": ctx["dependency_score"],
+                          "partial": coverage["partial"], "target": target.display, "report": path,
                           "report_json": os.path.join(out_dir, "report.json"), "counts": counts,
                           "top_findings": [f.to_dict() for f in top], "errors": errors}, indent=1))
     else:
         print()
         print(f"  {report.VERDICTS[v]}")
-        print(f"  score {ctx['score']}/100 · " + ", ".join(f"{counts[s]} {s}" for s in reversed(report.SEV_ORDER) if counts[s]))
+        if coverage["partial"]:
+            print(f"  ⚠️  partial analysis: {coverage['summary']}")
+        dep = f" (dependencies: {ctx['dependency_score']})" if ctx["dependency_score"] else ""
+        print(f"  score {ctx['score']}/100{dep} · " + ", ".join(f"{counts[s]} {s}" for s in reversed(report.SEV_ORDER) if counts[s]))
         for f in top:
-            print(f"   {report.SEV_ICON[f.severity]} [{f.source}/{f.context}] {f.title}" + (f": {clean(f.evidence, 100)}" if f.evidence else ""))
+            who = f" {clean(f.package, 60)}" if f.package else ""
+            print(f"   {report.SEV_ICON[f.severity]} [{f.source}/{f.context}{who}] {f.title}" + (f": {clean(f.evidence, 100)}" if f.evidence else ""))
         for e in errors:
             print(f"   ! {clean(e, 200)}")
         print(f"\n  report: {path}  ({ctx['duration_s']}s)\n")
@@ -277,8 +381,29 @@ def cmd_build(args):
         e = Engine(args.engine, verbose=True)
         e.ping()
         tag = image_tag()
+        if args.pull:
+            e.pull(tag, args.registry or REGISTRY_REPO)
+            print(f"pulled {tag}")
+            return 0
         e.build(tag, build_args=args.build_arg or [], network=args.network)
         print(f"built {tag}")
+        return 0
+    except SandboxError as ex:
+        print(f"cea: {ex}", file=sys.stderr)
+        return 2
+
+
+def cmd_image(args):
+    try:
+        e = Engine(args.engine)
+        e.ping()
+        tag = image_tag()
+        if args.action == "export":
+            e.export_image(tag, args.file)
+            print(f"exported {tag} -> {args.file}  (load it elsewhere with: cea image import {args.file})")
+        else:
+            e.import_image(tag, args.file)
+            print(f"imported {tag}")
         return 0
     except SandboxError as ex:
         print(f"cea: {ex}", file=sys.stderr)
@@ -289,10 +414,18 @@ def cmd_doctor(args):
     ok = True
     try:
         e = Engine(args.engine)
-        print(f"engine      {e.name} {e.ping()}")
+        try:
+            version = e.ping()
+        except SandboxError:
+            if not args.start:
+                raise
+            version = e.start(wait=args.wait)
+        print(f"engine      {e.name} {version}")
         tag = image_tag()
         has = e.has_image(tag)
-        print(f"image       {tag} {'present' if has else 'MISSING (run: cea build)'}")
+        print(f"image       {tag} " + ("present" if has else
+              f"MISSING\n            next: `cea build` ({BUILD_NEEDS}),\n"
+              "            or `cea build --pull` (pre-built image), or `cea image import <file>` (offline)"))
         ok &= has
         if has:
             r = e._run(["run", "--rm", "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -302,9 +435,12 @@ def cmd_doctor(args):
             print(f"strace      {'ok' if good else 'FAILED: ' + r.stderr.decode(errors='replace')[:200]}")
             ok &= good
     except SandboxError as ex:
-        print(f"engine      {ex}")
+        print("engine      " + str(ex).replace("\n", "\n            "))
         ok = False
     print("status      " + ("ready" if ok else "not ready"))
+    if not ok:
+        print("            meanwhile: `cea check --static-only <local dir/file>` runs the static scan only "
+              "(no sandbox, much weaker evidence)")
     return 0 if ok else 2
 
 
@@ -323,6 +459,8 @@ def main(argv=None):
     c.add_argument("--wait", type=int, default=5, help="seconds to linger after import to catch delayed payloads (default 5)")
     c.add_argument("--ci", action="store_true", help="pretend to be a CI runner (some malware only fires in CI)")
     c.add_argument("--no-import", action="store_true", help="skip the import/require step")
+    c.add_argument("--no-bin", action="store_true", help="don't run the package's bin with --help")
+    c.add_argument("--no-build", action="store_true", help="don't run `npm run build` when entry points are missing")
     c.add_argument("--static-only", action="store_true", help="no container: static scan of a local target only")
     c.add_argument("--npm", action="store_true", help="treat a bare name as an npm package (default)")
     c.add_argument("--pypi", action="store_true", help="treat a bare name as a PyPI package")
@@ -340,11 +478,21 @@ def main(argv=None):
     b = sub.add_parser("build", help="build the sandbox image")
     b.add_argument("--build-arg", action="append", help="e.g. NODE_IMAGE=... BASE_IMAGE=...")
     b.add_argument("--network", help="build network (e.g. host)")
+    b.add_argument("--pull", action="store_true", help="pull the pre-built image instead of building it")
+    b.add_argument("--registry", help=f"image repository for --pull (default {REGISTRY_REPO}, env CEA_IMAGE_REGISTRY)")
     b.add_argument("--engine")
     b.set_defaults(func=cmd_build)
 
+    im = sub.add_parser("image", help="move the sandbox image between machines (offline / blocked registries)")
+    im.add_argument("action", choices=["export", "import"])
+    im.add_argument("file", help="tar file to write (export) or read (import)")
+    im.add_argument("--engine")
+    im.set_defaults(func=cmd_image)
+
     d = sub.add_parser("doctor", help="check that the sandbox works on this machine")
     d.add_argument("--engine")
+    d.add_argument("--start", action="store_true", help="start the container engine if it is not running")
+    d.add_argument("--wait", type=int, default=90, help="seconds to wait for the engine with --start (default 90)")
     d.set_defaults(func=cmd_doctor)
 
     args = ap.parse_args(argv)

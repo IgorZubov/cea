@@ -177,14 +177,29 @@ BENIGN_EXE = re.compile(r"(^|/)(sh|bash|dash|node|npm|npx|python3?(\.\d+)?|pip3?
                         r"git|make|cc|gcc|g\+\+|cmake|node-gyp|ld|as|cc1plus|cc1|collect2|which|ls|mkdir|cp|mv|rm|true)$")
 
 
+def _plan_info(step_plan, st):
+    """Attribution data for a step result, taken from OUR plan (not from the sandbox's steps.json)."""
+    i = st.get("index")
+    plan = step_plan[i] if isinstance(i, int) and 0 <= i < len(step_plan or []) else {}
+    return {"package": plan.get("package") or "", "package_path": plan.get("package_path") or "",
+            "package_repo": plan.get("package_repo") or ""}
+
+
+def ctx_of(item):
+    return "dependency-install" if item.get("package") else item["phase"]
+
+
 def analyse(raw_dir, canaries, step_plan):
     steps = json.load(open(os.path.join(raw_dir, "steps.json")))["steps"]
+    for st in steps:
+        st.update(_plan_info(step_plan, st))
     findings = []
     behaviour = {"steps": [], "processes": [], "failed_exec": {}, "network": [], "dns": [],
                  "sensitive_reads": [], "writes_outside": [], "mutations": [], "leaks": []}
 
     for st in steps:
-        behaviour["steps"].append({k: st[k] for k in ("name", "phase", "cmd", "rc", "timed_out", "attempt")} |
+        behaviour["steps"].append({k: st.get(k) for k in ("index", "name", "phase", "cmd", "rc", "timed_out", "attempt",
+                                                           "package")} |
                                   {"duration": round(st["end"] - st["start"], 1), "output_tail": clean(st["output"][-600:], 600)})
         if not st.get("trace"):
             continue
@@ -194,6 +209,12 @@ def analyse(raw_dir, canaries, step_plan):
         with open(tpath, errors="replace") as fh:
             ev = trace_parse.parse(fh, step=st["phase"])
         phase = st["phase"]
+        pkg = {"package": st["package"], "package_path": st["package_path"]}
+        for group in ("processes", "connects", "opens", "mutations"):
+            for item in ev[group]:
+                item.update(pkg)
+        for info in ev["failed_exec"].values():
+            info.update(pkg)
         root_exe_seen = False
         for p in ev["processes"]:
             p["phase"] = phase
@@ -213,8 +234,8 @@ def analyse(raw_dir, canaries, step_plan):
                 c["phase"] = phase
                 behaviour["network"].append(c)
                 if re.search(r"docker\.sock|containerd|podman|dbus", c["addr"]):
-                    findings.append(Finding("socket-probe", "high", "Tried to reach a container/system socket", "dynamic",
-                                            evidence=clean(f"{c['addr']} by {argv_str(c['by'])}"), context=phase))
+                    findings.append(F("socket-probe", "high", "Tried to reach a container/system socket",
+                                      clean(f"{c['addr']} by {argv_str(c['by'])}"), c))
                 continue
             if c["addr"] in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and (c["port"] == 53 or c["port"] in SINK_PORTS):
                 continue
@@ -232,8 +253,8 @@ def analyse(raw_dir, canaries, step_plan):
             target = (mu["args"] or [""])[-1] if mu["call"].startswith(("rename", "symlink")) else (mu["args"] or [""])[0]
             if mu["call"] == "ptrace":
                 behaviour["mutations"].append(mu | {"phase": phase})
-                findings.append(Finding("ptrace", "high", "Uses ptrace (anti-debugging or process injection)", "dynamic",
-                                        evidence=clean(mu["raw"]), context=phase))
+                findings.append(F("ptrace", "high", "Uses ptrace (anti-debugging or process injection)",
+                                  clean(mu["raw"]), mu | {"phase": phase}))
                 continue
             if target.startswith("/") and not _m(ALLOWED_WRITE, target):
                 behaviour["mutations"].append(mu | {"phase": phase, "target": target})
@@ -248,31 +269,34 @@ def analyse(raw_dir, canaries, step_plan):
             except ValueError:
                 pass
 
-    def phase_at(t):
+    def step_at(t):
         best = None
         for st in steps:
             if st["start"] <= t <= st["end"]:
-                return st["phase"]
+                return st
             if st["start"] <= t:   # late event: belongs to the most recent step that had started
-                best = st["phase"]
-        return best or (steps[0]["phase"] if steps else "?")
+                best = st
+        return best or (steps[0] if steps else {"phase": "?", "package": "", "package_path": "", "package_repo": ""})
 
     blobs = []
     dns_seen = {}
     for e in net_events:
-        e["phase"] = phase_at(e.get("t", 0))
+        st = step_at(e.get("t", 0))
+        e["phase"] = st["phase"]
+        where = {"package": st.get("package", ""), "package_path": st.get("package_path", ""),
+                 "package_repo": st.get("package_repo", ""), "step": st.get("index")}
         if e["type"] == "dns":
-            key = (e.get("name", ""), e["phase"])
+            key = (e.get("name", ""), e["phase"], where["step"])
             if key in dns_seen:
                 dns_seen[key]["count"] += 1
                 continue
-            dns_seen[key] = {"name": e.get("name", ""), "phase": e["phase"], "count": 1}
+            dns_seen[key] = {"name": e.get("name", ""), "phase": e["phase"], "count": 1} | where
             behaviour["dns"].append(dns_seen[key])
             blobs.append((f"DNS query {e.get('name', '')}", e.get("name", "")))
         elif e["type"] in ("http", "tls", "tcp"):
             raw = base64.b64decode(e.get("raw", "")).decode("latin-1")
             body = base64.b64decode(e.get("body", "")).decode("latin-1") if e.get("body") else ""
-            item = {"type": e["type"], "port": e.get("port"), "phase": e["phase"]}
+            item = {"type": e["type"], "port": e.get("port"), "phase": e["phase"]} | where
             if e["type"] == "http":
                 item.update(tls=bool(e.get("tls")), method=e.get("method"), host=e.get("host"), path=clean(e.get("path"), 300),
                             body_preview=clean(body, 400), body_bytes=len(body),
@@ -284,6 +308,7 @@ def analyse(raw_dir, canaries, step_plan):
             else:
                 item.update(bytes=e.get("bytes"), preview=clean(raw, 200))
                 label = f"raw TCP :{e.get('port')}"
+            item["label"] = label
             behaviour["network"].append(item)
             blobs.append((label, raw + "\n" + body))
 
@@ -291,6 +316,15 @@ def analyse(raw_dir, canaries, step_plan):
     for p in behaviour["processes"]:
         blobs.append((f"command line of {p['path']}", argv_str(p["argv"])))
     leaks = find_leaks(detection_secrets(canaries), blobs)
+    leaked_labels = {where for _, where, _ in leaks}
+    owner = {}   # blob label -> the step item it came from (for attribution)
+    for it in behaviour["network"]:
+        if it.get("label"):
+            owner.setdefault(it["label"], it)
+    for d in behaviour["dns"]:
+        owner.setdefault(f"DNS query {d['name']}", d)
+    for p in behaviour["processes"]:
+        owner.setdefault(f"command line of {p['path']}", p)
     seen = set()
     for name, where, form in leaks:
         if (name, where) in seen:
@@ -298,10 +332,24 @@ def analyse(raw_dir, canaries, step_plan):
         seen.add((name, where))
         behaviour["leaks"].append({"secret": name, "where": where, "form": form})
         sev = "critical" if not where.startswith("command line") else "high"
+        src = owner.get(where, {})
         findings.append(Finding("canary-leak", sev, f"Honeypot secret {name} was sent out ({form})", "dynamic",
-                                evidence=clean(where, 300), context="exfiltration"))
+                                file=src.get("package_path") or "", evidence=clean(where, 300), context="exfiltration",
+                                package=src.get("package") or ""))
 
     # ---- findings from behaviour
+    # dependency downloads of its own prebuilt binary: classify first, the DNS lookups follow from them
+    dl = {}   # (step, host) -> (severity, reason) of the most suspicious request to that host
+    for n in behaviour["network"]:
+        if n.get("type") == "http":
+            n["download"] = classify_download(n, n.get("label") in leaked_labels)
+            if n["download"]:
+                k = (n.get("step"), (n.get("host") or "").split(":")[0].lower())
+                prev = dl.get(k)
+                if not prev or SEV_RANK[n["download"][0]] > SEV_RANK[prev[0]]:
+                    dl[k] = n["download"]
+            else:
+                dl[(n.get("step"), (n.get("host") or "").split(":")[0].lower())] = ("high", None)
     for d in behaviour["dns"]:
         if d["name"]:
             sev = "high" if d["phase"] in ("install", "import") else "medium"
@@ -310,22 +358,32 @@ def analyse(raw_dir, canaries, step_plan):
                 title = "DNS query that looks like encoded data (DNS exfiltration)"
             else:
                 title = f"Network: resolved a hostname during {d['phase']}"
-            findings.append(Finding("dns", sev, title, "dynamic", evidence=clean(d["name"]), context=d["phase"]))
+                known = dl.get((d.get("step"), d["name"].lower().rstrip(".")))
+                if known and known[1]:
+                    sev = "info" if known[0] == "low" else min(sev, known[0], key=SEV_RANK.get)
+                    title = f"Network: resolved {d['name']} for the download below"
+            findings.append(F("dns", sev, title, clean(d["name"]), d))
     run_sev = lambda phase, sev: "medium" if phase == "run" else sev  # tools/installers you run may use the net
     for n in behaviour["network"]:
         if n.get("type") == "http":
-            findings.append(Finding("http", run_sev(n["phase"], "high"), f"{'HTTPS' if n.get('tls') else 'HTTP'} {n['method']} request during {n['phase']}", "dynamic",
-                                    evidence=clean(f"{n['host']}{n['path']} body={n['body_preview'][:160]}"), context=n["phase"]))
+            ev = clean(f"{n['host']}{n['path']} body={n['body_preview'][:160]}")
+            if n.get("download"):
+                sev, reason = n["download"]
+                findings.append(F("dep-binary-download" if sev == "low" else "dep-artifact-download", sev,
+                                  f"{n['package']} {reason} (not checksum-verified by CEA)", ev, n))
+                continue
+            findings.append(F("http", run_sev(n["phase"], "high"), f"{'HTTPS' if n.get('tls') else 'HTTP'} {n['method']} request during {n['phase']}",
+                              ev, n))
         elif n.get("type") == "tls":
-            findings.append(Finding("tls", run_sev(n["phase"], "high"), f"HTTPS/TLS connection during {n['phase']}", "dynamic",
-                                    evidence=clean(f"SNI={n['sni']}"), context=n["phase"]))
+            findings.append(F("tls", run_sev(n["phase"], "high"), f"HTTPS/TLS connection during {n['phase']}",
+                              clean(f"SNI={n['sni']}"), n))
         elif n.get("family") in ("inet", "inet6") and n["addr"] not in ("127.0.0.1", "::1"):
-            findings.append(Finding("direct-ip", "high", "Connection attempt to a hard-coded IP", "dynamic",
-                                    evidence=clean(f"{n['addr']}:{n['port']} by {argv_str(n['by'])}"), context=n["phase"]))
+            findings.append(F("direct-ip", "high", "Connection attempt to a hard-coded IP",
+                              clean(f"{n['addr']}:{n['port']} by {argv_str(n['by'])}"), n))
     for r in behaviour["sensitive_reads"]:
         honey = r["path"].startswith(HOME + "/")
-        findings.append(Finding("secret-read", "high", "Read a credential/secret file" + (" (honeypot)" if honey else ""),
-                                "dynamic", evidence=clean(f"{r['path']} by {argv_str(r['by'])[:120]}"), context=r["phase"]))
+        findings.append(F("secret-read", "high", "Read a credential/secret file" + (" (honeypot)" if honey else ""),
+                          clean(f"{r['path']} by {argv_str(r['by'])[:120]}"), r))
     honey_paths = {f"{HOME}/{rel}" for rel in HONEY_RELS}
     grouped = {}   # ordinary writes outside the project, grouped per directory
     for w in behaviour["writes_outside"] + behaviour["mutations"]:
@@ -335,45 +393,143 @@ def analyse(raw_dir, canaries, step_plan):
         who = argv_str(w["by"])[:120]
         persist = _m(PERSISTENCE, path)
         if persist and w["phase"] == "run":
-            findings.append(Finding("persistence", "medium", "Modifies shell profile / autostart (expected only for "
-                                    "installers - check what it adds)", "dynamic", evidence=clean(f"{path} by {who}"),
-                                    context="run"))
+            findings.append(F("persistence", "medium", "Modifies shell profile / autostart (expected only for "
+                              "installers - check what it adds)", clean(f"{path} by {who}"), w))
         elif persist:
-            findings.append(Finding("persistence", "critical", "Persistence: modified shell profile/autostart/ssh keys",
-                                    "dynamic", evidence=clean(f"{path} by {who}"), context=w["phase"]))
+            findings.append(F("persistence", "critical", "Persistence: modified shell profile/autostart/ssh keys",
+                              clean(f"{path} by {who}"), w))
         elif path in honey_paths and w.get("call", "write") != "write":
-            findings.append(Finding("tamper", "high", f"Tampered with a credential file ({w.get('call', 'write')})",
-                                    "dynamic", evidence=clean(f"{path} by {who}"), context=w["phase"]))
+            findings.append(F("tamper", "high", f"Tampered with a credential file ({w.get('call', 'write')})",
+                              clean(f"{path} by {who}"), w))
         else:
             d = "/".join(path.split("/")[:4])
-            g = grouped.setdefault((d, w["phase"]), {"n": 0, "example": path, "by": who})
+            g = grouped.setdefault((d, w["phase"], w.get("package", "")),
+                                   {"n": 0, "example": path, "by": who, "phase": w["phase"],
+                                    "package": w.get("package", ""), "package_path": w.get("package_path", "")})
             g["n"] += 1
-    for (d, phase), g in grouped.items():
-        findings.append(Finding("write-outside", "low" if phase == "run" else "medium",
-                                f"Wrote/changed {g['n']} file(s) outside the project under {d}", "dynamic",
-                                evidence=clean(f"e.g. {g['example']} by {g['by']}"), context=phase))
+    for (d, phase, _), g in grouped.items():
+        findings.append(F("write-outside", "low" if phase == "run" else "medium",
+                          f"Wrote/changed {g['n']} file(s) outside the project under {d}",
+                          clean(f"e.g. {g['example']} by {g['by']}"), g))
     for p in behaviour["processes"]:
         cmd = argv_str(p["argv"])
         if p.get("root") or "<pip-setuptools-caller>" in cmd or "pip/_vendor" in cmd:
             continue   # the sandbox's own step command / pip's internal build helpers
         if SUSPICIOUS_CMD.search(cmd):
-            findings.append(Finding("suspicious-exec", "high", f"Ran a suspicious command during {p['phase']}", "dynamic",
-                                    evidence=clean(cmd, 300), context=p["phase"]))
+            findings.append(F("suspicious-exec", "high", f"Ran a suspicious command during {p['phase']}",
+                              clean(cmd, 300), p))
         elif p["phase"] == "import" and not BENIGN_EXE.search(p["path"]):
-            findings.append(Finding("import-exec", "medium", "Spawned a program just by being imported", "dynamic",
-                                    evidence=clean(cmd, 300), context="import"))
+            findings.append(F("import-exec", "medium", "Spawned a program just by being imported", clean(cmd, 300), p))
         elif not BENIGN_EXE.search(p["path"]):
-            findings.append(Finding("exec", "low", f"Executed a program during {p['phase']}", "dynamic",
-                                    evidence=clean(cmd, 300), context=p["phase"]))
+            findings.append(F("exec", "low", f"Executed a program during {p['phase']}", clean(cmd, 300), p))
     for base, info in behaviour["failed_exec"].items():
         if re.match(r"^(curl|wget|nc|ncat|socat|powershell|pwsh|python|perl|ruby|base64|openssl|ssh|scp|bash|xmrig|crontab|sudo)$", base):
-            findings.append(Finding("missing-tool", "medium", f"Tried to run `{base}` (not available in sandbox)", "dynamic",
-                                    evidence=clean(argv_str(info["argv"]), 300), context=info["phase"]))
-    for st in steps:
+            findings.append(F("missing-tool", "medium", f"Tried to run `{base}` (not available in sandbox)",
+                              clean(argv_str(info["argv"]), 300), info))
+    for st in final_attempts(steps):
         if st["timed_out"]:
-            findings.append(Finding("timeout", "medium", f"Step '{st['name']}' did not finish (hang, daemon, or slow build)",
-                                    "dynamic", context=st["phase"]))
+            findings.append(F("timeout", "medium", f"Step '{st['name']}' did not finish (hang, daemon, or slow build)",
+                              "", st))
+        elif step_status(st) == "failed":
+            last = [ln for ln in (st.get("output") or "").splitlines() if ln.strip()][-1:] or [""]
+            findings.append(F("step-failed", "info",
+                              f"Step '{st['name']}' failed (exit {st['rc']}): what it would have done next was not observed",
+                              clean(last[0], 200), st))
     return dedupe(findings), behaviour
+
+
+SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def F(rule, sev, title, evidence, item):
+    """A dynamic finding attributed to the step (and dependency) the event came from."""
+    return Finding(rule, sev, title, "dynamic", file=item.get("package_path") or "", evidence=evidence,
+                   context=ctx_of(item), package=item.get("package") or "")
+
+
+# Hosts that serve release artifacts. A body-less GET from a dependency's install script to one of these is
+# the "download my prebuilt binary" pattern (esbuild, ffmpeg-static, sharp, puppeteer, playwright, ...).
+ARTIFACT_HOSTS = re.compile(r"^(github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com|"
+                            r"codeload\.github\.com|registry\.npmjs\.org|registry\.yarnpkg\.com|nodejs\.org|"
+                            r"storage\.googleapis\.com|[\w-]+\.github\.io|cdn\.playwright\.dev|"
+                            r"playwright(-[\w]+)?\.azureedge\.net|binaries\.prisma\.sh|download\.cypress\.io|"
+                            r"downloads\.sentry-cdn\.com|cdn\.npmmirror\.com)$", re.I)
+# well-known downloaders whose artifacts don't live in their own repo's releases: package -> host[/path] prefix
+KNOWN_DOWNLOADERS = {
+    "puppeteer": ("storage.googleapis.com/chrome-for-testing-public/", "googlechromelabs.github.io/"),
+    "chromedriver": ("storage.googleapis.com/chrome-for-testing-public/", "googlechromelabs.github.io/"),
+    "playwright": ("cdn.playwright.dev/", "playwright.azureedge.net/"),
+    "playwright-core": ("cdn.playwright.dev/", "playwright.azureedge.net/"),
+    "sharp": ("github.com/lovell/sharp-libvips/releases/download/",),
+    "@prisma/engines": ("binaries.prisma.sh/",),
+    "prisma": ("binaries.prisma.sh/",),
+    "cypress": ("download.cypress.io/",),
+    "@sentry/cli": ("downloads.sentry-cdn.com/",),
+    "esbuild": ("registry.npmjs.org/@esbuild/",),
+}
+
+
+def _pkg_name(spec):
+    return spec.rsplit("@", 1)[0] if spec.count("@") > (1 if spec.startswith("@") else 0) else spec
+
+
+def classify_download(n, leaked):
+    """(severity, reason) when an HTTP request is a dependency fetching a release artifact, else None."""
+    if not n.get("package") or leaked or (n.get("method") or "").upper() != "GET" or n.get("body_bytes"):
+        return None
+    host = (n.get("host") or "").split(":")[0].lower().rstrip(".")
+    path = n.get("path") or ""
+    if not ARTIFACT_HOSTS.match(host) or re.search(r"[?&#]", path):
+        return None   # query strings could carry data; artifact URLs don't need them
+    repo = (n.get("package_repo") or "").lower()
+    m = re.match(r"^/([\w.-]+)/([\w.-]+)/releases/download/", path)
+    if host == "github.com" and m and repo and f"{m.group(1)}/{m.group(2)}".lower() == repo:
+        return ("low", "downloads its own prebuilt binary from its GitHub releases")
+    for prefix in KNOWN_DOWNLOADERS.get(_pkg_name(n["package"]), ()):
+        if f"{host}{path}".startswith(prefix):
+            return ("low", f"downloads its prebuilt binary from {prefix.split('/')[0]} (known downloader)")
+    return ("medium", f"downloads a release artifact from {host} (not its own repository)")
+
+
+def final_attempts(steps):
+    """The last attempt of each planned step (pip install has a --no-deps fallback)."""
+    last = {}
+    for st in steps:
+        last[st.get("index", id(st))] = st
+    return list(last.values())
+
+
+def step_status(st):
+    if st.get("timed_out"):
+        return "timeout"
+    rc = st.get("rc")
+    out = st.get("output") or st.get("output_tail") or ""
+    if st["phase"] in ("run", "import"):
+        # a CLI exiting non-zero on --help still ran; not being able to start it at all didn't
+        if rc in (126, 127) or "[cea] import failed" in out:
+            return "failed"
+        return "ok"
+    return "ok" if rc == 0 else "failed"
+
+
+def coverage(step_plan, behaviour, skipped, dynamic_ran):
+    """What was planned, what actually ran, and what was skipped (and why)."""
+    ran = {s.get("index"): s for s in final_attempts((behaviour or {}).get("steps", []))}
+    planned = []
+    for i, p in enumerate(step_plan or []):
+        st = ran.get(i)
+        status = step_status(st) if st else "not run"
+        planned.append({"name": p["name"], "phase": p["phase"], "package": p.get("package") or "",
+                        "status": status, "rc": st.get("rc") if st else None})
+    bad = [p for p in planned if p["status"] != "ok"]
+    any_ok = any(p["status"] == "ok" for p in planned if p["phase"] != "setup")
+    summary = ""
+    if bad:
+        summary = (f"{len(bad)} of {len(planned)} sandbox step(s) did not complete: "
+                   + ", ".join(f"{clean(p['name'], 60)} ({p['status']})" for p in bad[:4])
+                   + (" ..." if len(bad) > 4 else ""))
+    return {"planned": planned, "skipped": [{"what": w, "why": y} for w, y in (skipped or [])],
+            "partial": bool(dynamic_ran and bad), "any_ok": any_ok or not planned, "summary": summary}
 
 
 def dedupe(findings):

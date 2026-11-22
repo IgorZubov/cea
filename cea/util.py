@@ -26,7 +26,8 @@ class Finding:
     file: str = ""
     line: int = 0
     evidence: str = ""
-    context: str = ""    # install | import | run | runtime | dependency-install
+    context: str = ""    # install | import | build | run | runtime | dependency-install
+    package: str = ""    # dependency (name@version) the finding belongs to; empty = the target itself
 
     def to_dict(self):
         return asdict(self)
