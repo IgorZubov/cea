@@ -13,6 +13,7 @@
 Usage: sinkhole.py <log.jsonl> <ready-file> [tls-dir]
 """
 import base64
+import gzip
 import json
 import os
 import re
@@ -189,7 +190,7 @@ def handle_tls(conn, port):
         log(type="http", tls=True, port=port, sni=sni, method=method, path=path, host=headers.get("host", sni or ""),
             headers=headers, body=base64.b64encode(body).decode(), raw=base64.b64encode(data).decode())
         try:
-            tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            tls.sendall(http_response(method, path))
         except OSError:
             pass
     else:
@@ -201,6 +202,39 @@ def handle_tls(conn, port):
 
 
 # -------------------------------------------------------------------- HTTP
+def _empty_tar():
+    return b"\x00" * 1024   # two zero blocks = end-of-archive
+
+
+def fake_body(path):
+    """A minimal *valid* body for archive URLs, so install scripts that download their own binary
+    (ffmpeg-static, ...) don't crash on an empty response and abort the rest of the install."""
+    p = (path or "").split("?", 1)[0].split("#", 1)[0].lower()
+    gz = lambda b: gzip.compress(b, mtime=0)
+    table = [((".tar.gz", ".tgz"), "application/gzip", lambda: gz(_empty_tar())),
+             ((".gz",), "application/gzip", lambda: gz(b"")),
+             ((".zip",), "application/zip", lambda: b"PK\x05\x06" + b"\x00" * 18),
+             ((".tar.xz", ".txz"), "application/x-xz", lambda: __import__("lzma").compress(_empty_tar())),
+             ((".xz",), "application/x-xz", lambda: __import__("lzma").compress(b"")),
+             ((".tar.bz2", ".tbz2"), "application/x-bzip2", lambda: __import__("bz2").compress(_empty_tar())),
+             ((".bz2",), "application/x-bzip2", lambda: __import__("bz2").compress(b"")),
+             ((".tar",), "application/x-tar", _empty_tar)]
+    for exts, ctype, make in table:
+        if p.endswith(exts):
+            try:
+                return ctype, make()
+            except Exception:   # e.g. no lzma in this python build
+                break
+    return "text/plain", b""
+
+
+def http_response(method, path):
+    ctype, body = fake_body(path)
+    head = (f"HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n").encode()
+    return head if (method or "").upper() == "HEAD" else head + body
+
+
 HTTP_RE = re.compile(rb"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|CONNECT|PROPFIND) (\S+) HTTP/\d")
 
 
@@ -231,7 +265,7 @@ def handle(conn, port):
             log(type="http", tls=False, port=port, method=method, path=path, host=headers.get("host", ""),
                 headers=headers, body=base64.b64encode(body).decode(), raw=base64.b64encode(data).decode())
             try:
-                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                conn.sendall(http_response(method, path))
             except OSError:
                 pass
         else:

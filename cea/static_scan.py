@@ -205,7 +205,7 @@ def lifecycle_findings(pj, label, base, findings, is_root):
         install_files |= script_files(cmd, base)
     if not any(k in scripts for k in LIFECYCLE) and os.path.isfile(os.path.join(base, "binding.gyp")):
         findings.append(Finding("native-build", "low", "Has binding.gyp: node-gyp compiles native code on install",
-                                "static", file=f"{label}binding.gyp", context="install"))
+                                "static", file=f"{label}binding.gyp", context="install" if is_root else "dependency-install"))
     for dep_field in ("dependencies", "optionalDependencies"):
         for name, ver in (pj.get(dep_field) or {}).items():
             if isinstance(ver, str) and re.match(r"^(https?:|git(\+\w+)?:|github:|file:|[\w-]+/[\w.-]+(#.*)?$)", ver):
@@ -215,10 +215,28 @@ def lifecycle_findings(pj, label, base, findings, is_root):
     return install_files
 
 
+NPM_NAME_RE = re.compile(r"^(@[a-z0-9][\w.~-]*/)?[a-z0-9][\w.~-]*$", re.I)
+NPM_VERSION_RE = re.compile(r"^[0-9][\w.+-]*$")
+
+
+def github_repo(pj):
+    """'owner/repo' (lower-case) from a package.json `repository` field, if it points at GitHub."""
+    repo = pj.get("repository")
+    if isinstance(repo, dict):
+        repo = repo.get("url")
+    if not isinstance(repo, str):
+        return None
+    m = re.match(r"^(?:github:)?([\w.-]+)/([\w.-]+?)(?:\.git)?(?:#.*)?$", repo.strip()) or \
+        re.search(r"github\.com[/:]([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/#].*)?$", repo.strip())
+    return f"{m.group(1)}/{m.group(2)}".lower() if m else None
+
+
 def scan_npm_deps(node_modules, findings, skip_name=None):
-    """Lifecycle scripts of every installed dependency (they run on `npm install`)."""
+    """Lifecycle scripts of every installed dependency (they run on `npm install`).
+    Returns (number of deps, ["name@version", ...], [{name, version, spec, path, repo}, ...])."""
     deps = 0
     with_scripts = []
+    pkgs = []
     for dirpath, dirnames, filenames in os.walk(node_modules, followlinks=False):
         parent = os.path.basename(os.path.dirname(dirpath))
         grand = os.path.basename(os.path.dirname(os.path.dirname(dirpath)))
@@ -232,15 +250,23 @@ def scan_npm_deps(node_modules, findings, skip_name=None):
                     or (skip_name and os.path.relpath(dirpath, node_modules) == skip_name):
                 continue  # the target itself (already scanned from src/)
             deps += 1
-            label = f"node_modules/{os.path.relpath(dirpath, node_modules)}/"
+            rel_dir = os.path.relpath(dirpath, node_modules)
+            label = f"node_modules/{rel_dir}/"
             before = len(findings)
             files = lifecycle_findings(pj, label, dirpath, findings, is_root=False)
             if len(findings) > before:
-                with_scripts.append(f"{pj.get('name')}@{pj.get('version')}")
+                spec = f"{pj.get('name')}@{pj.get('version')}"
+                with_scripts.append(spec)
+                # npm matches `npm rebuild <name>` against the folder name (differs from pj.name for aliases)
+                folder = rel_dir.rsplit("node_modules/", 1)[-1]
+                pkgs.append({"name": folder, "version": pj.get("version") if isinstance(pj.get("version"), str) else None,
+                             "spec": spec, "path": label.rstrip("/"), "repo": github_repo(pj)})
             for rel in files:
                 scan_file(os.path.join(dirpath, rel), label + rel, findings, True, "dependency-install")
+            for f in findings[before:]:
+                f.package = f"{pj.get('name')}@{pj.get('version')}"
         dirnames[:] = [d for d in dirnames if d not in (".bin", ".cache")]
-    return deps, with_scripts
+    return deps, with_scripts, pkgs
 
 
 def scan_file(path, rel, findings, install_ctx, ctx_label, stats=None):
@@ -286,7 +312,8 @@ def scan_file(path, rel, findings, install_ctx, ctx_label, stats=None):
 
 def scan(src_root, node_modules=None, ecosystems=(), registry_pkg=False):
     findings = []
-    stats = {"scanned": 0, "skipped_large": 0, "files": 0, "dependencies": 0, "deps_with_install_scripts": []}
+    stats = {"scanned": 0, "skipped_large": 0, "files": 0, "dependencies": 0, "deps_with_install_scripts": [],
+             "install_script_pkgs": []}
     install_files = set()
 
     pj_path = os.path.join(src_root, "package.json")
@@ -296,7 +323,7 @@ def scan(src_root, node_modules=None, ecosystems=(), registry_pkg=False):
             install_files |= lifecycle_findings(pj, "", src_root, findings, is_root=not registry_pkg)
             stats["package"] = {"name": pj.get("name"), "version": pj.get("version"),
                                 "scripts": {k: v for k, v in (pj.get("scripts") or {}).items() if k in LIFECYCLE_SRC},
-                                "bin": pj.get("bin")}
+                                "bin": pj.get("bin"), "repo": github_repo(pj)}
         except Exception as e:
             findings.append(Finding("bad-manifest", "low", "Unparseable package.json", "static", evidence=str(e)))
     for name in ("setup.py",):
@@ -321,7 +348,7 @@ def scan(src_root, node_modules=None, ecosystems=(), registry_pkg=False):
         scan_file(path, rel, findings, in_install, "install" if in_install else "runtime", stats)
 
     if node_modules and os.path.isdir(node_modules):
-        stats["dependencies"], stats["deps_with_install_scripts"] = scan_npm_deps(
+        stats["dependencies"], stats["deps_with_install_scripts"], stats["install_script_pkgs"] = scan_npm_deps(
             node_modules, findings, skip_name=(stats.get("package") or {}).get("name"))
 
     # file-level combo: decoding + eval in the same file

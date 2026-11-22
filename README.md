@@ -71,14 +71,41 @@ cea check ./dir --static-only             # no container: static scan only
 | `--wait S` | seconds to linger after import, default 5 |
 | `--ci` | sets `CI=true`, `GITHUB_ACTIONS=true` ... |
 | `--no-import` | don't import/require the package |
+| `--no-bin` | don't run the package's first `bin` with `--help` |
+| `--no-build` | don't run `npm run build` when `main`/`bin` point at files missing from the source (e.g. `dist/`) |
 | `--out DIR` | reports dir (default `./cea-reports`, or `$CEA_REPORTS`) |
 | `--keep-work` | keep the fetched untrusted files in `<report>/work` |
 | `--engine docker\|podman` | pick the engine (auto-detected) |
 | `--runtime runsc` | use gVisor (or another OCI runtime) for kernel-level isolation |
 | `--memory`, `--cpus` | sandbox limits (3g / 2) |
 
-Other commands: `cea doctor` (verify the setup) and `cea build [--build-arg NODE_IMAGE=... --network host]`
-(rebuild the image, for example from a registry mirror).
+Other commands:
+
+| Command | Meaning |
+|---|---|
+| `cea doctor [--start]` | verify the setup and print the next step; `--start` starts Docker Desktop / OrbStack / Colima / `podman machine` / `dockerd` and waits for it |
+| `cea build [--build-arg NODE_IMAGE=... --network host]` | (re)build the image, e.g. from a registry mirror |
+| `cea build --pull [--registry REPO]` | pull the pre-built image instead (default `ghcr.io/igorzubov/cea-sandbox`, env `CEA_IMAGE_REGISTRY`) |
+| `cea image export FILE` / `cea image import FILE` | move the image to a machine that can't build it |
+
+`CEA_IMAGE=<image>` makes every stage use that image instead of the local `cea-sandbox:<hash>` build.
+
+### Setup troubleshooting
+
+- **Engine installed but not running**: `cea doctor` names the fix for your platform; `cea doctor --start` runs it.
+- **The build needs** a container registry (Docker Hub by default: `node:22-bookworm-slim`, `ubuntu:24.04`) and
+  Ubuntu's apt mirrors. If Docker Hub rate-limits you (HTTP 429), `cea build` suggests `mirror.gcr.io`.
+- **Registries blocked** (HTTP 403 / proxy refusal: corporate proxies, CI runners, AI agent sandboxes): build on a
+  machine with access and copy the image over (`cea image export cea.tar` there, `cea image import cea.tar` here),
+  or `cea build --pull` if `ghcr.io` is reachable, or point `--build-arg NODE_IMAGE=/BASE_IMAGE=` at a registry
+  you can reach.
+- **Proxies**: base-image pulls are done by the engine's daemon, which does **not** read your shell's
+  `HTTPS_PROXY`: configure it in Docker Desktop (Settings → Resources → Proxies), in a systemd drop-in for
+  `docker.service` (`Environment=HTTPS_PROXY=...`) or `/etc/docker/daemon.json` (`"proxies"`). `cea build` passes
+  your `HTTP(S)_PROXY`/`NO_PROXY` to the build as build args (for apt) and uses `--network host` when the proxy is on
+  `localhost`. A TLS-intercepting proxy's CA must be trusted by the daemon (system CA store, then restart it) for
+  pulls; the fetch stage of `cea check` picks it up from `CEA_CA_BUNDLE` / `SSL_CERT_FILE` / `NODE_EXTRA_CA_CERTS`.
+- **No sandbox at all**: `cea check --static-only ./dir` still runs the static scan (much weaker evidence).
 
 ## Verdicts
 
@@ -93,6 +120,13 @@ Other commands: `cea doctor` (verify the setup) and `cea build [--build-arg NODE
 Each check writes `report.md` (for humans and LLMs), `report.json` (everything, machine-readable) and
 `raw/` (strace logs, sinkhole log, step output) into `cea-reports/<target>-<timestamp>/`.
 
+The report has a **Coverage** section (which sandbox steps ran, failed or were skipped, and why) and flags a
+*partial analysis* when a step failed. Install scripts run one package at a time, so findings name the
+dependency they came from and one failing package can't hide the others. Findings are grouped into
+**Target** and **Dependencies**. When the sandbox run was clean, what dependencies merely *can* do (e.g.
+`child_process` in esbuild's install script) and a dependency downloading its own prebuilt binary from its own
+GitHub releases don't count towards the target's score; they are shown with a separate dependency score.
+
 ## How it works
 
 ```text
@@ -104,7 +138,9 @@ Each check writes `report.md` (for humans and LLMs), `report.json` (everything, 
              │                                  │  exfil endpoints, reverse shells, miners, binaries, .pth ...
              │                                  │
              │ 3. DETONATE  container:          │  --network none, read-only rootfs, --cap-drop ALL,
-             │    install → import → --run      │  no-new-privileges, non-root, pids/mem/cpu limits,
+             │    install (one step per package)│  no-new-privileges, non-root, pids/mem/cpu limits,
+             │    → build → import → bin --help │
+             │    → --run                       │
              │    all under strace -f           │  target copied into tmpfs, /work mounted read-only
              │    ├─ honeypot secrets           │  fake AWS/GitHub/npm/OpenAI tokens in env, ~/.ssh, ~/.aws,
              │    │                             │  ~/.npmrc, ~/.git-credentials, wallets, browser data...
